@@ -1,0 +1,10 @@
+{
+  "name": "fab-erp-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "firebase-admin": "^12.6.0",
+    "razorpay": "^2.9.4"
+  }
+}

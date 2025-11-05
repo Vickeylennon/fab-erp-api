@@ -1,19 +1,17 @@
 // api/create-payment-link.js
-// B2C only (pickup_bookings). Creates a Razorpay Payment Link and stores it on the booking doc.
-// Requires env vars: RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, GOOGLE_APPLICATION_CREDENTIALS_JSON
+// Creates a Razorpay Payment Link for a pickup_bookings doc
+// Env needed: RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, GOOGLE_APPLICATION_CREDENTIALS_JSON
 
-const Razorpay = require("razorpay");
-const admin = require("firebase-admin");
-
-// ----- CORS (single-origin echo; never comma-separated) -----
+// ---------- Strict CORS (echo single origin) ----------
 const ALLOWED_ORIGINS = new Set([
   "https://fab-erp.web.app",
   "https://fab-erp.firebaseapp.com"
 ]);
 
-function handleCors(req, res) {
+function setCors(req, res) {
   const origin = req.headers.origin || "";
   res.setHeader("Vary", "Origin");
+
   if (ALLOWED_ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
@@ -21,59 +19,67 @@ function handleCors(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Max-Age", "86400");
 
-  // Preflight short-circuit
   if (req.method === "OPTIONS") {
     res.status(204).end();
-    return true;
+    return true; // handled
   }
-
-  // Block disallowed origins (don’t send ACAO in this case)
   if (!ALLOWED_ORIGINS.has(origin)) {
+    // Do NOT send ACAO here; explicitly block
     res.status(403).json({ error: "CORS_ORIGIN_NOT_ALLOWED", origin });
     return true;
   }
   return false;
 }
 
-// ----- Firebase Admin init from env JSON -----
-function initAdminOrThrow() {
-  if (admin.apps.length) return admin;
-  const raw = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-  if (!raw) throw new Error("SERVER_MISCONFIG: Missing GOOGLE_APPLICATION_CREDENTIALS_JSON");
-  let creds;
-  try {
-    creds = JSON.parse(raw);
-  } catch (e) {
-    throw new Error("SERVER_MISCONFIG: GOOGLE_APPLICATION_CREDENTIALS_JSON parse error");
-  }
-  admin.initializeApp({ credential: admin.credential.cert(creds) });
-  return admin;
-}
-
 module.exports = async (req, res) => {
-  if (handleCors(req, res)) return; // CORS handled (OPTIONS or forbidden)
+  // 1) Always set CORS first so even crashes later still include headers
+  if (setCors(req, res)) return;
 
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
   try {
-    // Validate env
+    // 2) Lazy import inside try/catch (prevents top-level crash without CORS)
+    let Razorpay, admin;
+    try {
+      Razorpay = require("razorpay");
+      admin = require("firebase-admin");
+    } catch (e) {
+      return res.status(500).json({
+        error: "SERVER_MISCONFIG: Missing dependencies (razorpay or firebase-admin)"
+      });
+    }
+
+    // 3) Validate env
     const key_id = process.env.RAZORPAY_KEY_ID;
     const key_secret = process.env.RAZORPAY_KEY_SECRET;
+    const rawCreds = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+
     if (!key_id || !key_secret) {
       return res.status(500).json({ error: "SERVER_MISCONFIG: Missing Razorpay keys" });
     }
+    if (!rawCreds) {
+      return res.status(500).json({ error: "SERVER_MISCONFIG: Missing GOOGLE_APPLICATION_CREDENTIALS_JSON" });
+    }
 
-    // Input
+    // 4) Parse service account JSON & init admin (lazy)
+    let creds;
+    try {
+      creds = JSON.parse(rawCreds);
+    } catch {
+      return res.status(500).json({ error: "SERVER_MISCONFIG: GOOGLE_APPLICATION_CREDENTIALS_JSON parse error" });
+    }
+    if (!admin.apps.length) {
+      admin.initializeApp({ credential: admin.credential.cert(creds) });
+    }
+    const db = admin.firestore();
+
+    // 5) Input
     const { docId } = req.body || {};
     if (!docId) return res.status(400).json({ error: "docId is required" });
 
-    // Firestore
-    const a = initAdminOrThrow();
-    const db = a.firestore();
-
-    // Read booking
+    // 6) Read booking
     const ref = db.collection("pickup_bookings").doc(docId);
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ error: "booking not found" });
@@ -84,12 +90,10 @@ module.exports = async (req, res) => {
     if (status !== "delivered") {
       return res.status(400).json({ error: `invalid status: ${d.status}` });
     }
-
     const amountNumber =
       d?.pickupDetails?.totalAmount ??
       d?.totalAmount ??
       0;
-
     if (!amountNumber || isNaN(amountNumber)) {
       return res.status(400).json({ error: "invalid amount (pickupDetails.totalAmount or totalAmount)" });
     }
@@ -97,14 +101,12 @@ module.exports = async (req, res) => {
     const customerName = String(d?.Name ?? "Customer").trim();
     const mobile = String(d?.Mobile ?? "").replace(/[^\d]/g, ""); // optional
 
-    // Razorpay client
+    // 7) Razorpay client + link
     const rzp = new Razorpay({ key_id, key_secret });
-
-    // Create payment link
     const amountPaise = Math.round(Number(amountNumber) * 100);
     const referenceId = `pickup:${docId}`;
-    let link;
 
+    let link;
     try {
       link = await rzp.paymentLink.create({
         amount: amountPaise,
@@ -119,11 +121,10 @@ module.exports = async (req, res) => {
       });
     } catch (e) {
       const msg = e?.error?.description || e?.message || "razorpay_error";
-      console.error("RAZORPAY_ERROR", e?.error || e);
       return res.status(500).json({ error: `RAZORPAY: ${msg}` });
     }
 
-    // Save to Firestore
+    // 8) Save fields
     await ref.set(
       {
         paymentStatus: "Pending",
@@ -134,7 +135,7 @@ module.exports = async (req, res) => {
       { merge: true }
     );
 
-    // Response
+    // 9) Respond
     return res.status(200).json({
       paymentLinkURL: link.short_url || link.url,
       customerPhone: mobile,
@@ -142,7 +143,7 @@ module.exports = async (req, res) => {
       amount: amountNumber
     });
   } catch (e) {
-    console.error("INTERNAL_ERROR", e);
+    // CORS headers already set; the browser will see these now
     return res.status(500).json({ error: String(e.message || "internal_error") });
   }
 };

@@ -1,6 +1,6 @@
 {
   "functions": {
-    "api/*.js": {
+    "api/*.(cjs|js)": {
       "runtime": "nodejs18.x"
     }
   }

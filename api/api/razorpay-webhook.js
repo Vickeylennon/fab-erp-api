@@ -1,34 +1,30 @@
 // Razorpay webhook endpoint (set in dashboard)
-// URL: https://YOUR_DOMAIN/api/razorpay-webhook
-// Event to enable: payment_link.paid
-// Secret must match env WEBHOOK_SECRET
+// URL: https://YOUR_VERSEL_DOMAIN/api/razorpay-webhook
+// Events: payment_link.paid
+// Secret: must match env WEBHOOK_SECRET
 
 import crypto from "crypto";
 import admin from "firebase-admin";
 
-function initAdmin() {
+function initAdminOrThrow() {
   if (admin.apps.length) return admin;
-  const creds = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-  if (!creds) throw new Error("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON env var");
-  admin.initializeApp({
-    credential: admin.credential.cert(JSON.parse(creds))
-  });
+  const raw = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+  if (!raw) throw new Error("ADMIN_INIT: Missing GOOGLE_APPLICATION_CREDENTIALS_JSON");
+  let creds;
+  try { creds = JSON.parse(raw); }
+  catch (e) { throw new Error("ADMIN_INIT: Service account JSON invalid"); }
+  admin.initializeApp({ credential: admin.credential.cert(creds) });
   return admin;
 }
 
-// Vercel gives req.body already parsed; to verify signature we need raw.
-// Workaround: use the raw body from req.__POST_BODY if provided, else fallback.
-export const config = {
-  api: {
-    bodyParser: false
-  }
-};
+// Need raw body for signature validation
+export const config = { api: { bodyParser: false } };
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
-    let data = [];
-    req.on("data", chunk => data.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(data)));
+    const chunks = [];
+    req.on("data", c => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
 }
@@ -39,19 +35,15 @@ export default async function handler(req, res) {
     const raw = await readBody(req);
     const signature = req.headers["x-razorpay-signature"];
     const secret = process.env.WEBHOOK_SECRET;
-    if (!secret) throw new Error("WEBHOOK_SECRET not set");
+    if (!secret) { console.error("WEBHOOK: secret missing"); return res.status(500).end(); }
 
     const expected = crypto.createHmac("sha256", secret).update(raw).digest("hex");
-    if (expected !== signature) {
-      console.warn("Invalid Razorpay signature");
-      return res.status(400).send("Invalid signature");
-    }
+    if (expected !== signature) { console.warn("WEBHOOK: invalid signature"); return res.status(400).end(); }
 
     const event = JSON.parse(raw.toString("utf8"));
     const type = event?.event;
 
     if (type === "payment_link.paid" || type === "payment.paid") {
-      // Extract reference_id => "pickup:docId"
       const ref =
         event?.payload?.payment_link?.entity?.reference_id ||
         event?.payload?.payment?.entity?.notes?.reference_id ||
@@ -64,12 +56,9 @@ export default async function handler(req, res) {
       } else {
         docId = event?.payload?.payment_link?.entity?.notes?.docId || null;
       }
-      if (!docId) {
-        console.warn("DocId not found in webhook payload");
-        return res.status(200).end();
-      }
+      if (!docId) { console.warn("WEBHOOK: docId missing"); return res.status(200).end(); }
 
-      const a = initAdmin();
+      const a = initAdminOrThrow();
       const db = a.firestore();
 
       await db.collection("pickup_bookings").doc(docId).set({
@@ -81,7 +70,7 @@ export default async function handler(req, res) {
 
     return res.status(200).end();
   } catch (e) {
-    console.error(e);
+    console.error("WEBHOOK_INTERNAL", e);
     return res.status(500).end();
   }
 }

@@ -6,11 +6,12 @@ import admin from "firebase-admin";
 
 // --- allow only your frontends (optional; remove if not needed) ---
 const ALLOWED_ORIGINS = new Set([
+const ALLOWED_ORIGINS = new Set([
   "https://fab-erp.firebaseapp.com",
   "https://fab-erp.web.app",
-  "http://localhost:5173",
-  "http://localhost:5000"
-  "https://fab-erp-lf3sxmdku-vigneshs-projects-ae914a48.vercel.app"
+  "https://fab-erp-lf3sxmdku-vigneshs-projects-ae914a48.vercel.app", // your Vercel
+  // add your live ERP domain below if different:
+  // "https://YOUR-ERP-DOMAIN.com"
 ]);
 
 function cors(res, origin) {

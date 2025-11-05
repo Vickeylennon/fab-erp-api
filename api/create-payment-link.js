@@ -4,35 +4,20 @@
 import Razorpay from "razorpay";
 import admin from "firebase-admin";
 
-// --- CORS: handle preflight reliably (dev-safe) ---
+// --- CORS: permissive hotfix (unblocks file:// and any origin during setup) ---
 function cors(res, origin) {
   res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Origin", origin || "*"); // TEMP: allow all
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
   res.setHeader("Access-Control-Max-Age", "86400");
-
-  // Allow your production origins explicitly:
-  const ALLOWED = new Set([
-    "https://fab-erp.firebaseapp.com",
-    "https://fab-erp.web.app",
-    "https://fab-erp-lf3sxmdku-vigneshs-projects-ae914a48.vercel.app",
-    // add your ERP domain(s) below if different:
-    // "https://your-erp-domain.com"
-  ]);
-
-  // During setup, also allow null/unknown (file://, some previews)
-  if (!origin || origin === "null" || ALLOWED.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin || "*");
-  }
 }
 
 function initAdminOrThrow() {
   if (admin.apps.length) return admin;
   const raw = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
   if (!raw) throw new Error("ADMIN_INIT: Missing GOOGLE_APPLICATION_CREDENTIALS_JSON");
-  let creds;
-  try { creds = JSON.parse(raw); }
-  catch (e) { throw new Error("ADMIN_INIT: Service account JSON invalid"); }
+  let creds; try { creds = JSON.parse(raw); } catch { throw new Error("ADMIN_INIT: Service account JSON invalid"); }
   admin.initializeApp({ credential: admin.credential.cert(creds) });
   return admin;
 }
@@ -46,39 +31,28 @@ export default async function handler(req, res) {
     const { docId } = req.body || {};
     if (!docId) return res.status(400).json({ error: "docId is required" });
 
-    // ---- Firebase Admin
-    let a;
-    try { a = initAdminOrThrow(); }
-    catch (e) { console.error(e); return res.status(500).json({ error: String(e.message || e) }); }
+    const a = initAdminOrThrow();
     const db = a.firestore();
 
-    // ---- Razorpay
     const key_id = process.env.RAZORPAY_KEY_ID;
     const key_secret = process.env.RAZORPAY_KEY_SECRET;
-    if (!key_id || !key_secret) {
-      return res.status(500).json({ error: "RAZORPAY: Keys not set in env" });
-    }
+    if (!key_id || !key_secret) return res.status(500).json({ error: "RAZORPAY: Keys not set in env" });
     const rzp = new Razorpay({ key_id, key_secret });
 
-    // ---- Fetch booking (B2C only)
     const ref = db.collection("pickup_bookings").doc(docId);
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ error: "booking not found" });
     const d = snap.data() || {};
 
-    // ---- Validate fields
     const amountNumber = d?.pickupDetails?.totalAmount ?? d?.totalAmount ?? 0;
     if (!amountNumber || isNaN(amountNumber)) {
       return res.status(400).json({ error: "invalid amount (pickupDetails.totalAmount or totalAmount)" });
     }
     const status = String(d.status || "").trim().toLowerCase();
-    if (status !== "delivered") {
-      return res.status(400).json({ error: `invalid status: ${d.status}` });
-    }
+    if (status !== "delivered") return res.status(400).json({ error: `invalid status: ${d.status}` });
 
     const customerName = String(d?.Name ?? "Customer").trim();
-    const mobile = String(d?.Mobile ?? "").replace(/[^\d]/g, ""); // 91XXXXXXXXXX preferred
-
+    const mobile = String(d?.Mobile ?? "").replace(/[^\d]/g, "");
     const amountPaise = Math.round(Number(amountNumber) * 100);
     const referenceId = `pickup:${docId}`;
 

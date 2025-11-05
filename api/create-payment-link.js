@@ -1,10 +1,10 @@
 // B2C only: pickup_bookings
 // POST /api/create-payment-link  { docId: "..." }
 
-import Razorpay from "razorpay";
-import admin from "firebase-admin";
+const Razorpay = require("razorpay");
+const admin = require("firebase-admin");
 
-// --- CORS: permissive hotfix (unblocks file:// and any origin during setup) ---
+// --- CORS: permissive during setup (tighten later) ---
 function cors(res, origin) {
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Origin", origin || "*"); // TEMP: allow all
@@ -17,12 +17,13 @@ function initAdminOrThrow() {
   if (admin.apps.length) return admin;
   const raw = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
   if (!raw) throw new Error("ADMIN_INIT: Missing GOOGLE_APPLICATION_CREDENTIALS_JSON");
-  let creds; try { creds = JSON.parse(raw); } catch { throw new Error("ADMIN_INIT: Service account JSON invalid"); }
+  let creds;
+  try { creds = JSON.parse(raw); } catch (e) { throw new Error("ADMIN_INIT: Service account JSON invalid"); }
   admin.initializeApp({ credential: admin.credential.cert(creds) });
   return admin;
 }
 
-export default async function handler(req, res) {
+module.exports = async (req, res) => {
   cors(res, req.headers.origin);
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
@@ -31,14 +32,19 @@ export default async function handler(req, res) {
     const { docId } = req.body || {};
     if (!docId) return res.status(400).json({ error: "docId is required" });
 
-    const a = initAdminOrThrow();
+    // Firebase
+    let a;
+    try { a = initAdminOrThrow(); }
+    catch (e) { console.error(e); return res.status(500).json({ error: String(e.message || e) }); }
     const db = a.firestore();
 
+    // Razorpay
     const key_id = process.env.RAZORPAY_KEY_ID;
     const key_secret = process.env.RAZORPAY_KEY_SECRET;
     if (!key_id || !key_secret) return res.status(500).json({ error: "RAZORPAY: Keys not set in env" });
     const rzp = new Razorpay({ key_id, key_secret });
 
+    // Booking
     const ref = db.collection("pickup_bookings").doc(docId);
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ error: "booking not found" });
@@ -52,7 +58,8 @@ export default async function handler(req, res) {
     if (status !== "delivered") return res.status(400).json({ error: `invalid status: ${d.status}` });
 
     const customerName = String(d?.Name ?? "Customer").trim();
-    const mobile = String(d?.Mobile ?? "").replace(/[^\d]/g, "");
+    const mobile = String(d?.Mobile ?? "").replace(/[^\d]/g, ""); // 91XXXXXXXXXX
+
     const amountPaise = Math.round(Number(amountNumber) * 100);
     const referenceId = `pickup:${docId}`;
 
@@ -94,4 +101,4 @@ export default async function handler(req, res) {
     console.error("INTERNAL_ERROR", e);
     return res.status(500).json({ error: "internal_error" });
   }
-}
+};

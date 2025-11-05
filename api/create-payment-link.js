@@ -10,6 +10,7 @@ const ALLOWED_ORIGINS = new Set([
   "https://fab-erp.web.app",
   "http://localhost:5173",
   "http://localhost:5000"
+  "https://fab-erp-lf3sxmdku-vigneshs-projects-ae914a48.vercel.app"
 ]);
 
 function cors(res, origin) {

@@ -4,31 +4,36 @@
 import Razorpay from "razorpay";
 import admin from "firebase-admin";
 
-// --- allow only your frontends (optional; remove if not needed) ---
-const ALLOWED_ORIGINS = new Set([
-const ALLOWED_ORIGINS = new Set([
-  "https://fab-erp.firebaseapp.com",
-  "https://fab-erp.web.app",
-  "https://fab-erp-lf3sxmdku-vigneshs-projects-ae914a48.vercel.app", // your Vercel
-  // add your live ERP domain below if different:
-  // "https://YOUR-ERP-DOMAIN.com"
-]);
-
+// --- CORS: handle preflight reliably (dev-safe) ---
 function cors(res, origin) {
-  if (origin && ALLOWED_ORIGINS.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  }
+  res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  // Allow your production origins explicitly:
+  const ALLOWED = new Set([
+    "https://fab-erp.firebaseapp.com",
+    "https://fab-erp.web.app",
+    "https://fab-erp-lf3sxmdku-vigneshs-projects-ae914a48.vercel.app",
+    // add your ERP domain(s) below if different:
+    // "https://your-erp-domain.com"
+  ]);
+
+  // During setup, also allow null/unknown (file://, some previews)
+  if (!origin || origin === "null" || ALLOWED.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  }
 }
 
-function initAdmin() {
+function initAdminOrThrow() {
   if (admin.apps.length) return admin;
-  const creds = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-  if (!creds) throw new Error("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON env var");
-  admin.initializeApp({
-    credential: admin.credential.cert(JSON.parse(creds))
-  });
+  const raw = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+  if (!raw) throw new Error("ADMIN_INIT: Missing GOOGLE_APPLICATION_CREDENTIALS_JSON");
+  let creds;
+  try { creds = JSON.parse(raw); }
+  catch (e) { throw new Error("ADMIN_INIT: Service account JSON invalid"); }
+  admin.initializeApp({ credential: admin.credential.cert(creds) });
   return admin;
 }
 
@@ -41,28 +46,40 @@ export default async function handler(req, res) {
     const { docId } = req.body || {};
     if (!docId) return res.status(400).json({ error: "docId is required" });
 
-    // Init Firebase + Razorpay
-    const a = initAdmin();
+    // ---- Firebase Admin
+    let a;
+    try { a = initAdminOrThrow(); }
+    catch (e) { console.error(e); return res.status(500).json({ error: String(e.message || e) }); }
     const db = a.firestore();
 
+    // ---- Razorpay
     const key_id = process.env.RAZORPAY_KEY_ID;
     const key_secret = process.env.RAZORPAY_KEY_SECRET;
-    if (!key_id || !key_secret) throw new Error("Razorpay keys not set");
+    if (!key_id || !key_secret) {
+      return res.status(500).json({ error: "RAZORPAY: Keys not set in env" });
+    }
     const rzp = new Razorpay({ key_id, key_secret });
 
-    // Load booking (B2C only)
+    // ---- Fetch booking (B2C only)
     const ref = db.collection("pickup_bookings").doc(docId);
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ error: "booking not found" });
-    const d = snap.data();
+    const d = snap.data() || {};
 
-    // Amount (₹) → paise
+    // ---- Validate fields
     const amountNumber = d?.pickupDetails?.totalAmount ?? d?.totalAmount ?? 0;
-    if (!amountNumber || isNaN(amountNumber)) return res.status(400).json({ error: "invalid amount" });
-    const amountPaise = Math.round(Number(amountNumber) * 100);
+    if (!amountNumber || isNaN(amountNumber)) {
+      return res.status(400).json({ error: "invalid amount (pickupDetails.totalAmount or totalAmount)" });
+    }
+    const status = String(d.status || "").trim().toLowerCase();
+    if (status !== "delivered") {
+      return res.status(400).json({ error: `invalid status: ${d.status}` });
+    }
 
     const customerName = String(d?.Name ?? "Customer").trim();
-    const mobile = String(d?.Mobile ?? "").replace(/[^\d]/g, ""); // 91XXXXXXXXXX
+    const mobile = String(d?.Mobile ?? "").replace(/[^\d]/g, ""); // 91XXXXXXXXXX preferred
+
+    const amountPaise = Math.round(Number(amountNumber) * 100);
     const referenceId = `pickup:${docId}`;
 
     const payload = {
@@ -77,7 +94,14 @@ export default async function handler(req, res) {
       callback_method: "get"
     };
 
-    const link = await rzp.paymentLink.create(payload);
+    let link;
+    try {
+      link = await rzp.paymentLink.create(payload);
+    } catch (e) {
+      console.error("RAZORPAY_ERROR", e?.error || e);
+      const msg = e?.error?.description || e?.message || "razorpay_error";
+      return res.status(500).json({ error: `RAZORPAY: ${msg}` });
+    }
 
     await ref.set({
       paymentStatus: "Pending",
@@ -93,7 +117,7 @@ export default async function handler(req, res) {
       amount: amountNumber
     });
   } catch (e) {
-    console.error(e);
+    console.error("INTERNAL_ERROR", e);
     return res.status(500).json({ error: "internal_error" });
   }
 }

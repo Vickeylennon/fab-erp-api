@@ -1,24 +1,17 @@
-// Razorpay webhook endpoint (set in dashboard)
-// URL: https://YOUR_VERSEL_DOMAIN/api/razorpay-webhook
-// Events: payment_link.paid
-// Secret: must match env WEBHOOK_SECRET
+// POST /api/razorpay-webhook
+// Set in Razorpay dashboard: event payment_link.paid, Secret = WEBHOOK_SECRET
 
-import crypto from "crypto";
-import admin from "firebase-admin";
+const crypto = require("crypto");
+const admin = require("firebase-admin");
 
 function initAdminOrThrow() {
   if (admin.apps.length) return admin;
   const raw = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
   if (!raw) throw new Error("ADMIN_INIT: Missing GOOGLE_APPLICATION_CREDENTIALS_JSON");
-  let creds;
-  try { creds = JSON.parse(raw); }
-  catch (e) { throw new Error("ADMIN_INIT: Service account JSON invalid"); }
+  let creds; try { creds = JSON.parse(raw); } catch (e) { throw new Error("ADMIN_INIT: Service account JSON invalid"); }
   admin.initializeApp({ credential: admin.credential.cert(creds) });
   return admin;
 }
-
-// Need raw body for signature validation
-export const config = { api: { bodyParser: false } };
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -29,8 +22,9 @@ function readBody(req) {
   });
 }
 
-export default async function handler(req, res) {
+module.exports = async (req, res) => {
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
+
   try {
     const raw = await readBody(req);
     const signature = req.headers["x-razorpay-signature"];
@@ -50,9 +44,8 @@ export default async function handler(req, res) {
         event?.payload?.payment?.entity?.description || "";
 
       let docId = null;
-      if (ref.includes(":")) {
-        const [, id] = ref.split(":");
-        docId = id;
+      if (ref && ref.includes(":")) {
+        docId = ref.split(":")[1];
       } else {
         docId = event?.payload?.payment_link?.entity?.notes?.docId || null;
       }
@@ -73,4 +66,4 @@ export default async function handler(req, res) {
     console.error("WEBHOOK_INTERNAL", e);
     return res.status(500).end();
   }
-}
+};

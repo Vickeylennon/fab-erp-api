@@ -1,20 +1,25 @@
 // api/create-payment-link.js
 // Creates a Razorpay Payment Link for a pickup_bookings doc
-// Env needed: RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, GOOGLE_APPLICATION_CREDENTIALS_JSON
+// Env: RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, GOOGLE_APPLICATION_CREDENTIALS_JSON
 
-// ---------- Strict CORS (echo single origin) ----------
+// ---------- Strict CORS (single origin echo; allow no-origin for testing/tools) ----------
 const ALLOWED_ORIGINS = new Set([
   "https://fab-erp.web.app",
-  "https://fab-erp.firebaseapp.com"
+  "https://fab-erp.firebaseapp.com",
+  "https://fab-erp-api.vercel.app" // allow direct tests from the API domain if needed
 ]);
 
 function setCors(req, res) {
   const origin = req.headers.origin || "";
   res.setHeader("Vary", "Origin");
 
-  if (ALLOWED_ORIGINS.has(origin)) {
+  if (!origin) {
+    // No Origin header (direct browser hit, curl, server-to-server). Allow and respond with '*'.
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (ALLOWED_ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
+
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Max-Age", "86400");
@@ -23,8 +28,9 @@ function setCors(req, res) {
     res.status(204).end();
     return true; // handled
   }
-  if (!ALLOWED_ORIGINS.has(origin)) {
-    // Do NOT send ACAO here; explicitly block
+
+  if (origin && !ALLOWED_ORIGINS.has(origin)) {
+    // Block disallowed browser origins (don’t send ACAO in this case)
     res.status(403).json({ error: "CORS_ORIGIN_NOT_ALLOWED", origin });
     return true;
   }
@@ -32,7 +38,7 @@ function setCors(req, res) {
 }
 
 module.exports = async (req, res) => {
-  // 1) Always set CORS first so even crashes later still include headers
+  // 1) Always set CORS first
   if (setCors(req, res)) return;
 
   if (req.method !== "POST") {
@@ -40,7 +46,7 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // 2) Lazy import inside try/catch (prevents top-level crash without CORS)
+    // Lazy imports (so CORS headers are already set if something fails)
     let Razorpay, admin;
     try {
       Razorpay = require("razorpay");
@@ -51,11 +57,10 @@ module.exports = async (req, res) => {
       });
     }
 
-    // 3) Validate env
+    // Env checks
     const key_id = process.env.RAZORPAY_KEY_ID;
     const key_secret = process.env.RAZORPAY_KEY_SECRET;
     const rawCreds = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-
     if (!key_id || !key_secret) {
       return res.status(500).json({ error: "SERVER_MISCONFIG: Missing Razorpay keys" });
     }
@@ -63,23 +68,18 @@ module.exports = async (req, res) => {
       return res.status(500).json({ error: "SERVER_MISCONFIG: Missing GOOGLE_APPLICATION_CREDENTIALS_JSON" });
     }
 
-    // 4) Parse service account JSON & init admin (lazy)
+    // Admin init
     let creds;
-    try {
-      creds = JSON.parse(rawCreds);
-    } catch {
-      return res.status(500).json({ error: "SERVER_MISCONFIG: GOOGLE_APPLICATION_CREDENTIALS_JSON parse error" });
-    }
-    if (!admin.apps.length) {
-      admin.initializeApp({ credential: admin.credential.cert(creds) });
-    }
+    try { creds = JSON.parse(rawCreds); }
+    catch { return res.status(500).json({ error: "SERVER_MISCONFIG: GOOGLE_APPLICATION_CREDENTIALS_JSON parse error" }); }
+    if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(creds) });
     const db = admin.firestore();
 
-    // 5) Input
+    // Input
     const { docId } = req.body || {};
     if (!docId) return res.status(400).json({ error: "docId is required" });
 
-    // 6) Read booking
+    // Read booking
     const ref = db.collection("pickup_bookings").doc(docId);
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ error: "booking not found" });
@@ -87,13 +87,9 @@ module.exports = async (req, res) => {
 
     // Preconditions
     const status = String(d.status || "").trim().toLowerCase();
-    if (status !== "delivered") {
-      return res.status(400).json({ error: `invalid status: ${d.status}` });
-    }
-    const amountNumber =
-      d?.pickupDetails?.totalAmount ??
-      d?.totalAmount ??
-      0;
+    if (status !== "delivered") return res.status(400).json({ error: `invalid status: ${d.status}` });
+
+    const amountNumber = d?.pickupDetails?.totalAmount ?? d?.totalAmount ?? 0;
     if (!amountNumber || isNaN(amountNumber)) {
       return res.status(400).json({ error: "invalid amount (pickupDetails.totalAmount or totalAmount)" });
     }
@@ -101,8 +97,8 @@ module.exports = async (req, res) => {
     const customerName = String(d?.Name ?? "Customer").trim();
     const mobile = String(d?.Mobile ?? "").replace(/[^\d]/g, ""); // optional
 
-    // 7) Razorpay client + link
-    const rzp = new Razorpay({ key_id, key_secret });
+    // Razorpay
+    const rzp = new require("razorpay")({ key_id, key_secret });
     const amountPaise = Math.round(Number(amountNumber) * 100);
     const referenceId = `pickup:${docId}`;
 
@@ -124,18 +120,15 @@ module.exports = async (req, res) => {
       return res.status(500).json({ error: `RAZORPAY: ${msg}` });
     }
 
-    // 8) Save fields
-    await ref.set(
-      {
-        paymentStatus: "Pending",
-        "razorpay.paymentLinkId": link.id,
-        "razorpay.paymentLinkURL": link.short_url || link.url,
-        "razorpay.amount": amountNumber
-      },
-      { merge: true }
-    );
+    // Save
+    await ref.set({
+      paymentStatus: "Pending",
+      "razorpay.paymentLinkId": link.id,
+      "razorpay.paymentLinkURL": link.short_url || link.url,
+      "razorpay.amount": amountNumber
+    }, { merge: true });
 
-    // 9) Respond
+    // Response
     return res.status(200).json({
       paymentLinkURL: link.short_url || link.url,
       customerPhone: mobile,
@@ -143,7 +136,6 @@ module.exports = async (req, res) => {
       amount: amountNumber
     });
   } catch (e) {
-    // CORS headers already set; the browser will see these now
     return res.status(500).json({ error: String(e.message || "internal_error") });
   }
 };

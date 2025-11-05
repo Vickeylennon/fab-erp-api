@@ -4,7 +4,7 @@
 const Razorpay = require("razorpay");
 const admin = require("firebase-admin");
 
-// --- CORS: permissive during setup (tighten later) ---
+// --- CORS: permissive during setup (unblocks all) ---
 function cors(res, origin) {
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Origin", origin || "*"); // TEMP: allow all
@@ -17,8 +17,7 @@ function initAdminOrThrow() {
   if (admin.apps.length) return admin;
   const raw = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
   if (!raw) throw new Error("ADMIN_INIT: Missing GOOGLE_APPLICATION_CREDENTIALS_JSON");
-  let creds;
-  try { creds = JSON.parse(raw); } catch (e) { throw new Error("ADMIN_INIT: Service account JSON invalid"); }
+  let creds; try { creds = JSON.parse(raw); } catch { throw new Error("ADMIN_INIT: Service account JSON invalid"); }
   admin.initializeApp({ credential: admin.credential.cert(creds) });
   return admin;
 }
